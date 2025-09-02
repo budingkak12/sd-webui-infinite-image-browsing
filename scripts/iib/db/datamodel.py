@@ -110,6 +110,8 @@ class Image:
         }
 
     def save(self, conn):
+        # 确保路径规范化，避免重复路径问题
+        self.path = os.path.normpath(self.path)
         with closing(conn.cursor()) as cur:
             cur.execute(
                 "INSERT OR REPLACE  INTO image (path, exif, size, date) VALUES (?, ?, ?, ?)",
@@ -127,6 +129,9 @@ class Image:
     @classmethod
     def get(cls, conn: Connection, id_or_path):
         with closing(conn.cursor()) as cur:
+            # 如果是路径，确保规范化
+            if isinstance(id_or_path, str):
+                id_or_path = os.path.normpath(id_or_path)
             cur.execute(
                 "SELECT * FROM image WHERE id = ? OR path = ?", (id_or_path, id_or_path)
             )
@@ -535,65 +540,75 @@ class ImageTag:
         folder_paths: List[str] = None,
         random_sort: bool = False,
     ) -> tuple[List[Image], Cursor]:
+        # 重新设计查询逻辑，确保 not_tags 排除功能正确工作
+        has_and_tags = "and" in tag_dict and tag_dict["and"]
+        has_not_tags = "not" in tag_dict and tag_dict["not"]
+        has_or_tags = "or" in tag_dict and tag_dict["or"]
+        
+        # 基础查询
         query = """
-            SELECT image.id, image.path, image.size,image.date
+            SELECT DISTINCT image.id, image.path, image.size, image.date
             FROM image
-            INNER JOIN image_tag ON image.id = image_tag.image_id
         """
-
+        
         where_clauses = []
         params = []
-
-        for operator, tag_ids in tag_dict.items():
-            if operator == "and" and tag_dict["and"]:
-                where_clauses.append(
-                    "tag_id IN ({})".format(",".join("?" * len(tag_ids)))
-                )
-                params.extend(tag_ids)
-            elif operator == "not" and tag_dict["not"]:
-                where_clauses.append(
-                    """(image_id NOT IN (
-  SELECT image_id
-  FROM image_tag
-  WHERE tag_id IN ({})
-))""".format(
-                        ",".join("?" * len(tag_ids))
+        
+        # 处理 not_tags：使用 LEFT JOIN 和 IS NULL 来排除包含指定标签的图像
+        if has_not_tags:
+            not_tag_placeholders = ",".join("?" * len(tag_dict["not"]))
+            query += f"""
+                LEFT JOIN image_tag AS not_tag_join ON image.id = not_tag_join.image_id 
+                AND not_tag_join.tag_id IN ({not_tag_placeholders})
+            """
+            where_clauses.append("not_tag_join.image_id IS NULL")
+            params.extend(tag_dict["not"])
+        
+        # 处理 and_tags 和 or_tags：使用单独的 JOIN
+        if has_and_tags or has_or_tags:
+            query += " INNER JOIN image_tag ON image.id = image_tag.image_id"
+            
+            if has_and_tags:
+                and_tag_placeholders = ",".join("?" * len(tag_dict["and"]))
+                where_clauses.append(f"image_tag.tag_id IN ({and_tag_placeholders})")
+                params.extend(tag_dict["and"])
+            
+            if has_or_tags:
+                or_tag_placeholders = ",".join("?" * len(tag_dict["or"]))
+                where_clauses.append(f"""
+                    image.id IN (
+                        SELECT image_id
+                        FROM image_tag
+                        WHERE tag_id IN ({or_tag_placeholders})
+                        GROUP BY image_id
+                        HAVING COUNT(DISTINCT tag_id) >= 1
                     )
-                )
-                params.extend(tag_ids)
-            elif operator == "or" and tag_dict["or"]:
-                where_clauses.append(
-                    """(image_id IN (
-  SELECT image_id
-  FROM image_tag
-  WHERE tag_id IN ({})
-  GROUP BY image_id
-  HAVING COUNT(DISTINCT tag_id) >= 1
-)
-)""".format(
-                        ",".join("?" * len(tag_ids))
-                    )
-                )
-                params.extend(tag_ids)    
+                """)
+                params.extend(tag_dict["or"])
 
+        # 处理文件夹路径过滤
         if folder_paths:
             folder_clauses = []
             for folder_path in folder_paths:
                 folder_clauses.append("(image.path LIKE ?)")
                 params.append(os.path.join(folder_path, "%"))
-                print(folder_path)
             where_clauses.append("(" + " OR ".join(folder_clauses) + ")")
 
+        # 处理游标分页
         if cursor and not random_sort:
             where_clauses.append("(image.date < ?)")
             params.append(cursor)
+            
+        # 添加 WHERE 子句
         if where_clauses:
             query += " WHERE " + " AND ".join(where_clauses)
-        query += " GROUP BY image.id"
-        if "and" in tag_dict and tag_dict['and']:
-            query += " HAVING COUNT(DISTINCT tag_id) = ?"
+        
+        # 处理 and_tags 的 GROUP BY 和 HAVING
+        if has_and_tags:
+            query += " GROUP BY image.id HAVING COUNT(DISTINCT image_tag.tag_id) = ?"
             params.append(len(tag_dict["and"]))
-
+        
+        # 处理排序和限制
         if random_sort:
             query += " ORDER BY RANDOM() LIMIT ?"
             # For random sort, use offset-based pagination
@@ -604,8 +619,9 @@ class ImageTag:
                 except (ValueError, TypeError):
                     pass  # Invalid cursor, start from beginning
         else:
-            query += " ORDER BY date DESC LIMIT ?"
+            query += " ORDER BY image.date DESC LIMIT ?"
         params.append(limit)
+        
         api_cur = Cursor()
         with closing(conn.cursor()) as cur:
             cur.execute(query, params)

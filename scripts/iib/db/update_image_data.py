@@ -143,32 +143,43 @@ def get_extra_meta_keys_from_plugins(source_identifier: str):
     return []
 
 def build_single_img_idx(conn, file_path, is_rebuild, safe_save_img_tag):
-    img = DbImg.get(conn, file_path)
+    # 确保文件路径规范化，避免重复路径问题
+    normalized_path = os.path.normpath(file_path)
+    img = DbImg.get(conn, normalized_path)
     parsed_params = None
+    
     if is_rebuild:
-        info = get_exif_data(file_path)
+        info = get_exif_data(normalized_path)
         parsed_params = info.params
         if not img:
             img = DbImg(
-                file_path,
+                normalized_path,
                 info.raw_info,
-                os.path.getsize(file_path),
-                get_modified_date(file_path),
+                os.path.getsize(normalized_path),
+                get_modified_date(normalized_path),
             )
+            img.save(conn)
+        else:
+            # 重建时也要更新现有图像信息
+            img.path = normalized_path
+            img.exif = info.raw_info
+            img.size = os.path.getsize(normalized_path)
+            img.date = get_modified_date(normalized_path)
             img.save(conn)
     else:
         if img:  # 已存在的跳过
             if img.date == get_modified_date(img.path):
                 return
             else:
+                # 文件已修改，先删除旧的标签关联
                 DbImg.safe_batch_remove(conn=conn, image_ids=[img.id])
-        info = get_exif_data(file_path)
+        info = get_exif_data(normalized_path)
         parsed_params = info.params
         img = DbImg(
-            file_path,
+            normalized_path,
             info.raw_info,
-            os.path.getsize(file_path),
-            get_modified_date(file_path),
+            os.path.getsize(normalized_path),
+            get_modified_date(normalized_path),
         )
         img.save(conn)
 
